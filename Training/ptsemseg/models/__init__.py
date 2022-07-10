@@ -1,7 +1,7 @@
 import copy
 import torchvision.models as models
 
-from encoding.nn import SyncBatchNorm
+# from encoding.nn import SyncBatchNorm
 from ptsemseg.models.td4_psp.pspnet_4p import pspnet_4p
 from ptsemseg.models.td4_psp.td4_psp import td4_psp
 from ptsemseg.models.td2_psp.pspnet_2p import pspnet_2p
@@ -23,8 +23,8 @@ def get_model(model_dict, nclass, loss_fn=None, mdl_path=None, teacher=None):
     if teacher is not  None:
         param_dict['teacher'] = teacher
 
-    if param_dict['syncBN']:
-        param_dict['norm_layer'] = SyncBatchNorm
+    # if param_dict['syncBN']:
+    #     param_dict['norm_layer'] = SyncBatchNorm
     param_dict.pop('syncBN')
     
     model = model(nclass=nclass, **param_dict)
