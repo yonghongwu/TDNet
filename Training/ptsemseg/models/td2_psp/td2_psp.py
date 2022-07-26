@@ -22,7 +22,7 @@ class td2_psp(nn.Module):
                  norm_layer=nn.BatchNorm2d,
                  backbone='resnet101',
                  dilated=True,
-                 aux=True,
+                 aux=False,
                  multi_grid=True,
                  loss_fn=None,
                  path_num=None,
@@ -37,6 +37,7 @@ class td2_psp(nn.Module):
         self.norm_layer = norm_layer
         self._up_kwargs = up_kwargs
         self.nclass = nclass
+        self.aux = aux
 
         # copying modules from pretrained models
         self.backbone = backbone
@@ -72,8 +73,10 @@ class td2_psp(nn.Module):
         self.atn1 = Attention(512*self.expansion//4,64,norm_layer)
         self.atn2 = Attention(512*self.expansion//4,64,norm_layer)
 
-        self.layer_norm1 = Layer_Norm([97, 193])
-        self.layer_norm2 = Layer_Norm([97, 193])
+        # self.layer_norm1 = Layer_Norm([97, 193])
+        # self.layer_norm2 = Layer_Norm([97, 193])
+        self.layer_norm1 = Layer_Norm([40, 24])
+        self.layer_norm2 = Layer_Norm([40, 24])
 
         self.head1 = FCNHead(512*self.expansion//4, nclass, norm_layer, chn_down=2)
         self.head2 = FCNHead(512*self.expansion//4, nclass, norm_layer, chn_down=2)
@@ -87,11 +90,11 @@ class td2_psp(nn.Module):
         self.KLD = nn.KLDivLoss()
         self.get_params()
         self.teacher = teacher
-     
-    
+
+
     def forward_path1(self, f_img):
-        f1_img = f_img[0]
-        f2_img = f_img[1]
+        f1_img = f_img[:, 0, ...]
+        f2_img = f_img[:, 1, ...]
         
         _, _, h, w = f2_img.size()
 
@@ -108,27 +111,35 @@ class td2_psp(nn.Module):
         out1 = self.head1(self.layer_norm1(atn_1 + v1))
         out1_sub = self.head1(self.layer_norm1(v1))
 
-        outputs1 = F.interpolate(out1, (h, w), **self._up_kwargs)
+        outputs1 = F.interpolate(out1, (h, w), **self._up_kwargs)   # Done: improve
         outputs1_sub = F.interpolate(out1_sub, (h, w), **self._up_kwargs)
         
-        if self.training:
+        if self.training and self.teacher is not None:
             #############Knowledge-distillation###########
             self.teacher.eval()
             T_logit_12, T_logit_1, T_logit_2 = self.teacher(f2_img)
+            f = nn.AdaptiveAvgPool2d((40, 24))
             T_logit_12 = T_logit_12.detach()
             T_logit_1 = T_logit_1.detach()
             T_logit_2 = T_logit_2.detach()
            
-            KD_loss1 = self.KLDive_loss(out1,T_logit_12)+ 0.5*self.KLDive_loss(out1_sub,T_logit_1)
+            KD_loss1 = self.KLDive_loss(f(out1),T_logit_12)+ 0.5*self.KLDive_loss(f(out1_sub),T_logit_1)
             auxout1 = self.auxlayer1(c3_1)        
             auxout1 = F.interpolate(auxout1, (h, w), **self._up_kwargs)
             return outputs1, outputs1_sub, auxout1, KD_loss1
+        elif self.training and self.teacher is None:
+            if self.aux:
+                auxout1 = self.auxlayer1(c3_1)
+                auxout1 = F.interpolate(auxout1, (h, w), **self._up_kwargs)
+                return outputs1, outputs1_sub, auxout1
+            else:
+                return outputs1, outputs1_sub
         else:
             return outputs1
         
     def forward_path2(self, f_img):
-        f1_img = f_img[0]
-        f2_img = f_img[1]
+        f1_img = f_img[:, 0, ...]
+        f2_img = f_img[:, 1, ...]
         
         _, _, h, w = f2_img.size()
 
@@ -145,26 +156,34 @@ class td2_psp(nn.Module):
         out2 = self.head2(self.layer_norm2(atn_2 + v2))
         out2_sub = self.head2(self.layer_norm2(v2))
 
-        outputs2 = F.interpolate(out2, (h, w), **self._up_kwargs)
+        outputs2 = F.interpolate(out2, (h, w), **self._up_kwargs)   # Done: improve
         outputs2_sub = F.interpolate(out2_sub, (h, w), **self._up_kwargs)
         
-        if self.training:
+        if self.training and self.teacher is not None:
             #############Knowledge-distillation###########
             self.teacher.eval()
+            f = nn.AdaptiveAvgPool2d((40, 24))
             T_logit_12, T_logit_1, T_logit_2 = self.teacher(f2_img)
             T_logit_12 = T_logit_12.detach()
             T_logit_1 = T_logit_1.detach()
             T_logit_2 = T_logit_2.detach()
 
-            KD_loss2 = self.KLDive_loss(out2,T_logit_12)+ 0.5*self.KLDive_loss(out2_sub,T_logit_2)
+            KD_loss2 = self.KLDive_loss(f(out2),T_logit_12)+ 0.5*self.KLDive_loss(f(out2_sub),T_logit_2)
 
             auxout2 = self.auxlayer2(c3_2)
             auxout2 = F.interpolate(auxout2, (h, w), **self._up_kwargs)
             return outputs2, outputs2_sub, auxout2, KD_loss2
+        elif self.training and self.teacher is None:
+            if self.aux:
+                auxout1 = self.auxlayer1(c3_1)
+                auxout1 = F.interpolate(auxout1, (h, w), **self._up_kwargs)
+                return outputs2, outputs2_sub, auxout1
+            else:
+                return outputs2, outputs2_sub
         else:
             return outputs2
 
-        
+
     def forward(self, f2_img, lbl=None, pos_id=None):
         
         if pos_id == 0:
@@ -174,18 +193,29 @@ class td2_psp(nn.Module):
         else:
             raise RuntimeError("Only Two Paths.")
 
-        if self.training:
+        if self.training and self.teacher is not None:
             outputs_, outputs_sub, auxout, KD_loss = outputs
-            loss = self.loss_fn(outputs_,lbl) +\
-                    0.5*self.loss_fn(outputs_sub,lbl) +\
-                    0.1*self.loss_fn(auxout,lbl) +\
-                    1*KD_loss
-
+            loss = self.loss_fn[0](outputs_,lbl[0]) + self.loss_fn[1](outputs_, lbl[0].unsqueeze(1)) + \
+                    self.loss_fn[0](outputs_sub,lbl) +\
+                    0.2 * self.loss_fn[0](auxout,lbl) +\
+                    0.1 * KD_loss
             return loss
+        elif self.training and self.teacher is None:
+            if self.aux:
+                outputs_, outputs_sub, auxout = outputs
+                loss = self.loss_fn[0](outputs_, lbl) + self.loss_fn[1](outputs_, lbl.unsqueeze(1)) + \
+                       0.2 * self.loss_fn[0](outputs_sub, lbl) + \
+                       0.1 * self.loss_fn[0](auxout, lbl)
+                return loss
+            else:
+                outputs_, outputs_sub = outputs
+                loss = self.loss_fn[0](outputs_, lbl) + 0.2 * self.loss_fn[1](outputs_, lbl.unsqueeze(1)) + \
+                       0.2 * self.loss_fn[0](outputs_sub, lbl)
+                return loss
         else:
             return outputs
 
-        
+
     def KLDive_loss(self, Q, P):
         # Info_gain - KL Divergence
         # P is the target
@@ -200,7 +230,7 @@ class td2_psp(nn.Module):
     def get_params(self):
         wd_params, nowd_params, lr_mul_wd_params, lr_mul_nowd_params = [], [], [], []
         for name, child in self.named_children():
-            if isinstance(child, (OhemCELoss2D, SegmentationLosses, pspnet_2p, nn.KLDivLoss)):
+            if isinstance(child, (OhemCELoss2D, SegmentationLosses, nn.CrossEntropyLoss, pspnet_2p, nn.KLDivLoss)):
                 continue
             child_wd_params, child_nowd_params = child.get_params()
             if isinstance(child, (Encoding, Attention, PyramidPooling, FCNHead, Layer_Norm)):
@@ -304,18 +334,37 @@ class PyramidPooling(nn.Module):
         return wd_params, nowd_params
 
 class FCNHead(nn.Module):
-    def __init__(self, in_channels, out_channels, norm_layer, up_kwargs={}, chn_down=4):
+    def __init__(self, in_channels, out_channels, norm_layer=None, up_kwargs=None, chn_down=4, acti_layer=None):
         super(FCNHead, self).__init__()
 
-        inter_channels = in_channels // chn_down
+        if up_kwargs is None:
+            up_kwargs = {}
+        inter_channels = in_channels // chn_down    # change: 512-->256-->nclass ------ 512-->256-->UP-->128-->UP-->64-->UP-->32-->2
 
         self._up_kwargs = up_kwargs
-        self.norm_layer = norm_layer
+        self.norm_layer = norm_layer if norm_layer is not None else nn.BatchNorm2d
+        self.acti_layer = acti_layer if acti_layer is not None else nn.ReLU
         self.conv5 = nn.Sequential(nn.Conv2d(in_channels, inter_channels, 3, padding=1, bias=False),
-                                   norm_layer(inter_channels),
-                                   nn.ReLU(),
+                                   self.norm_layer(inter_channels),
+                                   self.acti_layer(),
                                    nn.Dropout2d(0.1, False),
-                                   nn.Conv2d(inter_channels, out_channels, 1))
+
+                                   nn.ConvTranspose2d(inter_channels, inter_channels//2, kernel_size=(4, 4),  stride=2, padding=1, bias=False),
+                                   self.norm_layer(inter_channels//2),
+                                   self.acti_layer(),
+                                   nn.Dropout2d(0.1, False),
+
+                                   nn.ConvTranspose2d(inter_channels//2, inter_channels//4, kernel_size=(4, 4), stride=2, padding=1, bias=False),
+                                   self.norm_layer(inter_channels//4),
+                                   self.acti_layer(),
+                                   nn.Dropout2d(0.1, False),
+
+                                   nn.ConvTranspose2d(inter_channels//4, inter_channels//8, kernel_size=(4, 4), stride=2, padding=1, bias=False),
+                                   self.norm_layer(inter_channels//8),
+                                   self.acti_layer(),
+                                   nn.Dropout2d(0.1, False),
+
+                                   nn.Conv2d(inter_channels//8, out_channels, 1))
         self.init_weight()
 
     def forward(self, x):

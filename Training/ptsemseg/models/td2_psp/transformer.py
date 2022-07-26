@@ -160,7 +160,7 @@ class ConvBNReLU(nn.Module):
                 bias = bias)
         self.norm_layer = norm_layer
         if norm_layer is not None:
-            self.bn = norm_layer(out_chan, activation='leaky_relu')
+            self.bn = norm_layer(out_chan)  # , activation='leaky_relu'
   
         self.init_weight()
 

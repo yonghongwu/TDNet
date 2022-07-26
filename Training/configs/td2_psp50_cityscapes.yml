@@ -1,6 +1,6 @@
 model:
     arch: td2_psp
-    backbone: resnet50
+    backbone: resnet34
     syncBN: True
     path_num: 2
 
