@@ -1,22 +1,25 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .resnet import resnet18,resnet34,resnet50
+from .resnet import resnet18, resnet34, resnet50
 import random
 from ptsemseg.utils import split_psp_dict
 from ptsemseg.models.td2_psp.pspnet_2p import pspnet_2p
 import logging
 import pdb
 import os
-from ptsemseg.loss import OhemCELoss2D,SegmentationLosses
+from ptsemseg.loss import OhemCELoss2D, SegmentationLosses
 from .transformer import Encoding, Attention
+from Training.utils.CCT_tool.unet import Encoder, Decoder
 
 up_kwargs = {'mode': 'bilinear', 'align_corners': True}
 logger = logging.getLogger("ptsemseg")
 
+
 class td2_psp(nn.Module):
     """
     """
+
     def __init__(self,
                  nclass=21,
                  norm_layer=nn.BatchNorm2d,
@@ -26,8 +29,8 @@ class td2_psp(nn.Module):
                  multi_grid=True,
                  loss_fn=None,
                  path_num=None,
-                 mdl_path = None,
-                 teacher = None
+                 mdl_path=None,
+                 teacher=None
                  ):
         super(td2_psp, self).__init__()
 
@@ -41,8 +44,8 @@ class td2_psp(nn.Module):
 
         # copying modules from pretrained models
         self.backbone = backbone
-        assert(backbone == 'resnet50' or backbone == 'resnet34' or backbone == 'resnet18')
-        assert(path_num == 2)
+        assert (backbone == 'resnet50' or backbone == 'resnet34' or backbone == 'resnet18')
+        assert (path_num == 2)
 
         if backbone == 'resnet18':
             ResNet_ = resnet18
@@ -59,108 +62,120 @@ class td2_psp(nn.Module):
         else:
             raise RuntimeError("Four branch model only support ResNet18 amd ResNet34")
 
-        self.pretrained1 = ResNet_(pretrained=True, dilated=dilated, multi_grid=multi_grid,
-                                           deep_base=deep_base, norm_layer=norm_layer)
-        self.pretrained2 = ResNet_(pretrained=True, dilated=dilated, multi_grid=multi_grid,
-                                           deep_base=deep_base, norm_layer=norm_layer)
-        # bilinear upsample options
+        params = {'in_chns': 1,
+                  'feature_chns': [16, 32, 64, 128, 256],
+                  'dropout': [0., 0., 0., 0., 0.],
+                  'class_num': 2,
+                  'bilinear': False,
+                  'acti_func': 'relu'}
+        self.pretrained3 = Encoder(params)  # todo: 使用FusionNet_2D
+        self.pretrained4 = Encoder(params)
 
-        self.psp1 =  PyramidPooling(512*self.expansion, norm_layer, self._up_kwargs, path_num=self.path_num, pid=0)
-        self.psp2 =  PyramidPooling(512*self.expansion, norm_layer, self._up_kwargs, path_num=self.path_num, pid=1)
+        self.decoder = Decoder(params)
 
-        self.enc1 = Encoding(512*self.expansion,64,512*self.expansion//4,norm_layer)
-        self.enc2 = Encoding(512*self.expansion,64,512*self.expansion//4,norm_layer)
-        self.atn1 = Attention(512*self.expansion//4,64,norm_layer)
-        self.atn2 = Attention(512*self.expansion//4,64,norm_layer)
+        self.psp1 = PyramidPooling(256 * self.expansion, norm_layer, self._up_kwargs, path_num=self.path_num, pid=0)
+        self.psp2 = PyramidPooling(256 * self.expansion, norm_layer, self._up_kwargs, path_num=self.path_num, pid=1)
 
-        # self.layer_norm1 = Layer_Norm([97, 193])
-        # self.layer_norm2 = Layer_Norm([97, 193])
-        self.layer_norm1 = Layer_Norm([40, 24])
-        self.layer_norm2 = Layer_Norm([40, 24])
+        self.enc1 = Encoding(256 * self.expansion, 64 // 2, 256 * self.expansion // 4, norm_layer)
+        self.enc2 = Encoding(256 * self.expansion, 64 // 2, 256 * self.expansion // 4, norm_layer)
+        self.atn1 = Attention(256 * self.expansion // 4, 64 // 2, norm_layer)
+        self.atn2 = Attention(256 * self.expansion // 4, 64 // 2, norm_layer)
 
-        self.head1 = FCNHead(512*self.expansion//4, nclass, norm_layer, chn_down=2)
-        self.head2 = FCNHead(512*self.expansion//4, nclass, norm_layer, chn_down=2)
+        self.layer_norm1 = Layer_Norm([40 // 2, 24 // 2])
+        self.layer_norm2 = Layer_Norm([40 // 2, 24 // 2])
 
+        if self.aux:
+            self.auxlayer1 = FCNHead(256 // 2 * self.expansion, nclass, norm_layer)
+            self.auxlayer2 = FCNHead(256 // 2 * self.expansion, nclass, norm_layer)
 
-        if aux:
-            self.auxlayer1 = FCNHead(256*self.expansion, nclass, norm_layer)
-            self.auxlayer2 = FCNHead(256*self.expansion, nclass, norm_layer)
-
-        self.pretrained_init()
+        # self.pretrained_init()
+        self.init()
         self.KLD = nn.KLDivLoss()
-        self.get_params()
+        # self.get_params()
         self.teacher = teacher
-
 
     def forward_path1(self, f_img):
         f1_img = f_img[:, 0, ...]
         f2_img = f_img[:, 1, ...]
-        
+
         _, _, h, w = f2_img.size()
 
-        c3_1,c4_1 = self.pretrained1(f2_img)
-        c3_2,c4_2 = self.pretrained2(f1_img)
+        features3 = self.pretrained3(f2_img)
+        features4 = self.pretrained4(f1_img)
 
-        z1 = self.psp1(c4_1)
-        z2 = self.psp2(c4_2)
+        z1 = self.psp1(features3[-1])
+        z2 = self.psp2(features4[-1])
 
         q1, v1 = self.enc1(z1, pre=False)
         k2_, v2_ = self.enc2(z2, pre=True)
 
         atn_1 = self.atn1(k2_, v2_, q1, fea_size=z1.size())
-        out1 = self.head1(self.layer_norm1(atn_1 + v1))
-        out1_sub = self.head1(self.layer_norm1(v1))
 
-        outputs1 = F.interpolate(out1, (h, w), **self._up_kwargs)   # Done: improve
+        features3.pop()
+        features3.append(self.layer_norm1(atn_1 + v1).repeat(1, 4, 1, 1))
+        out1 = self.decoder(features3)
+
+        features3.pop()
+        features3.append(self.layer_norm1(v1).repeat(1, 4, 1, 1))
+        out1_sub = self.decoder(features3)
+
+        outputs1 = F.interpolate(out1, (h, w), **self._up_kwargs)  # Done: improve
         outputs1_sub = F.interpolate(out1_sub, (h, w), **self._up_kwargs)
-        
+
         if self.training and self.teacher is not None:
-            #############Knowledge-distillation###########
+            # Knowledge-distillation #
             self.teacher.eval()
             T_logit_12, T_logit_1, T_logit_2 = self.teacher(f2_img)
             f = nn.AdaptiveAvgPool2d((40, 24))
             T_logit_12 = T_logit_12.detach()
             T_logit_1 = T_logit_1.detach()
             T_logit_2 = T_logit_2.detach()
-           
-            KD_loss1 = self.KLDive_loss(f(out1),T_logit_12)+ 0.5*self.KLDive_loss(f(out1_sub),T_logit_1)
-            auxout1 = self.auxlayer1(c3_1)        
+
+            KD_loss1 = self.KLDive_loss(f(out1), T_logit_12) + 0.5 * self.KLDive_loss(f(out1_sub), T_logit_1)
+            auxout1 = self.auxlayer1(features3[-2])
             auxout1 = F.interpolate(auxout1, (h, w), **self._up_kwargs)
             return outputs1, outputs1_sub, auxout1, KD_loss1
         elif self.training and self.teacher is None:
             if self.aux:
-                auxout1 = self.auxlayer1(c3_1)
+                auxout1 = self.auxlayer1(features3[-2])
                 auxout1 = F.interpolate(auxout1, (h, w), **self._up_kwargs)
                 return outputs1, outputs1_sub, auxout1
             else:
                 return outputs1, outputs1_sub
         else:
             return outputs1
-        
+
     def forward_path2(self, f_img):
         f1_img = f_img[:, 0, ...]
         f2_img = f_img[:, 1, ...]
-        
+
         _, _, h, w = f2_img.size()
 
-        c3_1,c4_1 = self.pretrained1(f1_img)
-        c3_2,c4_2 = self.pretrained2(f2_img)
+        features3 = self.pretrained3(f1_img)
+        features4 = self.pretrained4(f2_img)
 
-        z1 = self.psp1(c4_1)
-        z2 = self.psp2(c4_2)
+        z1 = self.psp1(features3[-1])  # (_, 512, 40, 24)//2
+        z2 = self.psp2(features4[-1])  # (_, 512, 40, 24)//2
 
-        k1_, v1_ = self.enc1(z1, pre=True)
-        q2,  v2 = self.enc2(z2, pre=False)
+        k1_, v1_ = self.enc1(z1, pre=True)  # (_, 112, 64), (_, 112, 128)//2
+        q2, v2 = self.enc2(z2, pre=False)  # (_, 960, 64), (_, 128, 40, 24)//2
 
-        atn_2 = self.atn2(k1_, v1_, q2, fea_size=z2.size())
-        out2 = self.head2(self.layer_norm2(atn_2 + v2))
-        out2_sub = self.head2(self.layer_norm2(v2))
+        atn_2 = self.atn2(k1_, v1_, q2, fea_size=z2.size())  # (_, 128, 40, 24)//2
 
-        outputs2 = F.interpolate(out2, (h, w), **self._up_kwargs)   # Done: improve
+        features3.pop()
+        features3.append(self.layer_norm2(atn_2 + v2).repeat(1, 4, 1, 1))
+        out2 = self.decoder(features3)
+        # ↑ (_, 2, 320, 192), Todo: how to up sample (_, 128, 20, 12)--> (_, 2, 320, 192)
+
+        features3.pop()
+        features3.append(self.layer_norm2(v2).repeat(1, 4, 1, 1))
+        out2_sub = self.decoder(features3)  # (_, 2, 320, 192)
+
+        outputs2 = F.interpolate(out2, (h, w), **self._up_kwargs)  # Done: improve
         outputs2_sub = F.interpolate(out2_sub, (h, w), **self._up_kwargs)
-        
+
         if self.training and self.teacher is not None:
-            #############Knowledge-distillation###########
+            # Knowledge-distillation #
             self.teacher.eval()
             f = nn.AdaptiveAvgPool2d((40, 24))
             T_logit_12, T_logit_1, T_logit_2 = self.teacher(f2_img)
@@ -168,14 +183,14 @@ class td2_psp(nn.Module):
             T_logit_1 = T_logit_1.detach()
             T_logit_2 = T_logit_2.detach()
 
-            KD_loss2 = self.KLDive_loss(f(out2),T_logit_12)+ 0.5*self.KLDive_loss(f(out2_sub),T_logit_2)
+            KD_loss2 = self.KLDive_loss(f(out2), T_logit_12) + 0.5 * self.KLDive_loss(f(out2_sub), T_logit_2)
 
-            auxout2 = self.auxlayer2(c3_2)
+            auxout2 = self.auxlayer2(features4[-2])
             auxout2 = F.interpolate(auxout2, (h, w), **self._up_kwargs)
             return outputs2, outputs2_sub, auxout2, KD_loss2
         elif self.training and self.teacher is None:
             if self.aux:
-                auxout1 = self.auxlayer1(c3_1)
+                auxout1 = self.auxlayer1(features4[-2])
                 auxout1 = F.interpolate(auxout1, (h, w), **self._up_kwargs)
                 return outputs2, outputs2_sub, auxout1
             else:
@@ -183,9 +198,8 @@ class td2_psp(nn.Module):
         else:
             return outputs2
 
-
     def forward(self, f2_img, lbl=None, pos_id=None):
-        
+
         if pos_id == 0:
             outputs = self.forward_path1(f2_img)
         elif pos_id == 1:
@@ -195,36 +209,35 @@ class td2_psp(nn.Module):
 
         if self.training and self.teacher is not None:
             outputs_, outputs_sub, auxout, KD_loss = outputs
-            loss = self.loss_fn[0](outputs_,lbl[0]) + self.loss_fn[1](outputs_, lbl[0].unsqueeze(1)) + \
-                    self.loss_fn[0](outputs_sub,lbl) +\
-                    0.2 * self.loss_fn[0](auxout,lbl) +\
-                    0.1 * KD_loss
+            loss = self.loss_fn[0](outputs_, lbl[0]) + 0.2 * self.loss_fn[1](outputs_, lbl[0].unsqueeze(1)) + \
+                   0.5 * self.loss_fn[0](outputs_sub, lbl) + \
+                   0.2 * self.loss_fn[0](auxout, lbl) + \
+                   0.1 * KD_loss
             return loss
         elif self.training and self.teacher is None:
             if self.aux:
                 outputs_, outputs_sub, auxout = outputs
-                loss = self.loss_fn[0](outputs_, lbl) + self.loss_fn[1](outputs_, lbl.unsqueeze(1)) + \
-                       0.2 * self.loss_fn[0](outputs_sub, lbl) + \
-                       0.1 * self.loss_fn[0](auxout, lbl)
+                loss = self.loss_fn[0](outputs_, lbl) + 0.2 * self.loss_fn[1](outputs_, lbl.unsqueeze(1)) + \
+                       0.5 * self.loss_fn[0](outputs_sub, lbl) + \
+                       0.2 * self.loss_fn[0](auxout, lbl)
                 return loss
             else:
                 outputs_, outputs_sub = outputs
                 loss = self.loss_fn[0](outputs_, lbl) + 0.2 * self.loss_fn[1](outputs_, lbl.unsqueeze(1)) + \
-                       0.2 * self.loss_fn[0](outputs_sub, lbl)
+                       0.5 * self.loss_fn[0](outputs_sub, lbl)
                 return loss
         else:
             return outputs
-
 
     def KLDive_loss(self, Q, P):
         # Info_gain - KL Divergence
         # P is the target
         # Q is the computed one
         temp = 1
-        P = F.softmax(P/temp,dim=1)+1e-8 
-        Q = F.softmax(Q/temp,dim=1)+1e-8 
-    
-        KLDiv = (P * (P/Q).log()).sum(1)* (temp**2)
+        P = F.softmax(P / temp, dim=1) + 1e-8
+        Q = F.softmax(Q / temp, dim=1) + 1e-8
+
+        KLDiv = (P * (P / Q).log()).sum(1) * (temp ** 2)
         return KLDiv.mean()
 
     def get_params(self):
@@ -241,16 +254,16 @@ class td2_psp(nn.Module):
                 nowd_params += child_nowd_params
         return wd_params, nowd_params, lr_mul_wd_params, lr_mul_nowd_params
 
-
     def pretrained_init(self):
 
         if self.psp_path is not None:
             if os.path.isfile(self.psp_path):
                 logger.info("Initializaing sub networks with pretrained '{}'".format(self.psp_path))
                 print("Initializaing sub networks with pretrained '{}'".format(self.psp_path))
-                
+
                 model_state = torch.load(self.psp_path)
-                backbone_state, psp_state, head_state1, head_state2, _, _, auxlayer_state = split_psp_dict(model_state,self.path_num)
+                backbone_state, psp_state, head_state1, head_state2, _, _, auxlayer_state = split_psp_dict(model_state,
+                                                                                                           self.path_num)
 
                 self.pretrained1.load_state_dict(backbone_state, strict=True)
                 self.pretrained2.load_state_dict(backbone_state, strict=True)
@@ -261,6 +274,23 @@ class td2_psp(nn.Module):
 
             else:
                 logger.info("No pretrained found at '{}'".format(self.psp_path))
+
+    def init(self):
+        try:
+            a = torch.load("/storage/wuyonghuang/airway/result/TDNet_V2_1.0/model/model_epoch_13.pth")
+            from collections import OrderedDict
+            weights3, weights4 = OrderedDict(), OrderedDict()
+            for key in a.keys():
+                if 'pretrained3' in key:
+                    weights3['.'.join(key.split('.')[2:])] = a[key]
+                if 'pretrained4' in key:
+                    weights4['.'.join(key.split('.')[2:])] = a[key]
+            self.pretrained3.load_state_dict(weights3)
+            self.pretrained4.load_state_dict(weights4)
+            print('load weights successfully.')
+        except:
+            print('Not load weights successfully.')
+
 
 class PyramidPooling(nn.Module):
     """
@@ -302,11 +332,11 @@ class PyramidPooling(nn.Module):
         feat3 = F.interpolate(self.conv3(self.pool3(x)), (h, w), **self._up_kwargs)
         feat4 = F.interpolate(self.conv4(self.pool4(x)), (h, w), **self._up_kwargs)
 
-        x = x[:, self.pid*c//self.path_num:(self.pid+1)*c//self.path_num]
-        feat1 = feat1[:, self.pid*c//(self.path_num*4):(self.pid+1)*c//(self.path_num*4)]
-        feat2 = feat2[:, self.pid*c//(self.path_num*4):(self.pid+1)*c//(self.path_num*4)]
-        feat3 = feat3[:, self.pid*c//(self.path_num*4):(self.pid+1)*c//(self.path_num*4)]
-        feat4 = feat4[:, self.pid*c//(self.path_num*4):(self.pid+1)*c//(self.path_num*4)]
+        x = x[:, self.pid * c // self.path_num:(self.pid + 1) * c // self.path_num]
+        feat1 = feat1[:, self.pid * c // (self.path_num * 4):(self.pid + 1) * c // (self.path_num * 4)]
+        feat2 = feat2[:, self.pid * c // (self.path_num * 4):(self.pid + 1) * c // (self.path_num * 4)]
+        feat3 = feat3[:, self.pid * c // (self.path_num * 4):(self.pid + 1) * c // (self.path_num * 4)]
+        feat4 = feat4[:, self.pid * c // (self.path_num * 4):(self.pid + 1) * c // (self.path_num * 4)]
 
         return torch.cat((x, feat1, feat2, feat3, feat4), 1)
 
@@ -333,13 +363,14 @@ class PyramidPooling(nn.Module):
                 nowd_params += list(module.parameters())
         return wd_params, nowd_params
 
+
 class FCNHead(nn.Module):
     def __init__(self, in_channels, out_channels, norm_layer=None, up_kwargs=None, chn_down=4, acti_layer=None):
         super(FCNHead, self).__init__()
 
         if up_kwargs is None:
             up_kwargs = {}
-        inter_channels = in_channels // chn_down    # change: 512-->256-->nclass ------ 512-->256-->UP-->128-->UP-->64-->UP-->32-->2
+        inter_channels = in_channels // chn_down  # change: 512-->256-->nclass ------ 512-->256-->UP-->128-->UP-->64-->UP-->32-->2
 
         self._up_kwargs = up_kwargs
         self.norm_layer = norm_layer if norm_layer is not None else nn.BatchNorm2d
@@ -349,22 +380,25 @@ class FCNHead(nn.Module):
                                    self.acti_layer(),
                                    nn.Dropout2d(0.1, False),
 
-                                   nn.ConvTranspose2d(inter_channels, inter_channels//2, kernel_size=(4, 4),  stride=2, padding=1, bias=False),
-                                   self.norm_layer(inter_channels//2),
+                                   nn.ConvTranspose2d(inter_channels, inter_channels // 2, kernel_size=(4, 4), stride=2,
+                                                      padding=1, bias=False),
+                                   self.norm_layer(inter_channels // 2),
                                    self.acti_layer(),
                                    nn.Dropout2d(0.1, False),
 
-                                   nn.ConvTranspose2d(inter_channels//2, inter_channels//4, kernel_size=(4, 4), stride=2, padding=1, bias=False),
-                                   self.norm_layer(inter_channels//4),
+                                   nn.ConvTranspose2d(inter_channels // 2, inter_channels // 4, kernel_size=(4, 4),
+                                                      stride=2, padding=1, bias=False),
+                                   self.norm_layer(inter_channels // 4),
                                    self.acti_layer(),
                                    nn.Dropout2d(0.1, False),
 
-                                   nn.ConvTranspose2d(inter_channels//4, inter_channels//8, kernel_size=(4, 4), stride=2, padding=1, bias=False),
-                                   self.norm_layer(inter_channels//8),
+                                   nn.ConvTranspose2d(inter_channels // 4, inter_channels // 8, kernel_size=(4, 4),
+                                                      stride=2, padding=1, bias=False),
+                                   self.norm_layer(inter_channels // 8),
                                    self.acti_layer(),
                                    nn.Dropout2d(0.1, False),
 
-                                   nn.Conv2d(inter_channels//8, out_channels, 1))
+                                   nn.Conv2d(inter_channels // 8, out_channels, 1))
         self.init_weight()
 
     def forward(self, x):
@@ -391,6 +425,7 @@ class FCNHead(nn.Module):
             elif isinstance(module, (self.norm_layer)):
                 nowd_params += list(module.parameters())
         return wd_params, nowd_params
+
 
 class Layer_Norm(nn.Module):
     def __init__(self, shape):

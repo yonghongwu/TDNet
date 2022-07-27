@@ -15,8 +15,9 @@ import logging
 import albumentations as al
 import oyaml as yaml
 import shutil
+import sys
+sys.path.append('../')
 
-from util import calculate_dice
 from ptsemseg.models import get_model
 from ptsemseg.loss.losses import DiceLoss
 from utils.util import calculate_dice
@@ -27,7 +28,7 @@ from utils.sendEmail import let_me_know
 
 # ------------------模型，优化方法------------------------------
 torch.backends.cudnn.enabled = False
-os.environ["CUDA_VISIBLE_DEVICES"] = "0, 4"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1, 2"
 
 
 class parser(object):
@@ -62,13 +63,13 @@ args = parser()
 args.seed = 0
 args.epochs = 50
 args.earlystop = 5
-args.lr = 5e-4  # Note.
+args.lr = 3e-4  # Note.
 args.ratio = 1.0
 args.batchsize = torch.cuda.device_count()
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 
-res_name = '../../result/TDNet_' + str(args.ratio)
+res_name = '../../result/TDNet_V3_' + str(args.ratio)
 if not os.path.exists(res_name):
     os.makedirs(res_name)
 model_name = os.path.join(res_name, 'model')
@@ -85,7 +86,7 @@ if not os.path.exists(res_name+'/code'):
 
 trans = {
     'train': al.Compose([
-        al.RandomResizedCrop(height=320, width=200, scale=(0.95, 1.0), ratio=(0.95, 1.05)),
+        al.RandomResizedCrop(height=320, width=200, scale=(0.95, 1.0), ratio=(0.95, 1.05), p=0.1),
         al.HorizontalFlip(p=0.1),
         al.VerticalFlip(p=0.1),
     ]),
@@ -97,7 +98,7 @@ trans = {
 
 c16_32 = 32
 dataset = air_dataset_2(args=args, train_path='../../train_data', test_path='../../test_data',
-                        unlabel_path='../../unlabel_process', semi=False, transform=None, para=c16_32)
+                        unlabel_path='../../unlabel_process', semi=False, transform=trans['train'], para=c16_32)
 Loader = torch.utils.data.DataLoader(dataset, batch_size=args.batchsize, shuffle=True, num_workers=0, pin_memory=False,
                                      collate_fn=collate_2)
 
@@ -109,7 +110,7 @@ net = get_model(cfg["model"], 2, [torch.nn.CrossEntropyLoss(), losses.DiceLoss(2
 net.cuda()
 net = torch.nn.DataParallel(net, device_ids=None)
 print('-' * 10 + 'send to GPU' + '-' * 10)
-optimizer = optim.Adam(net.parameters(), lr=0.001)
+optimizer = optim.Adam(net.parameters(), lr=args.lr)
 
 def lr_scheduler(optimizer, init_lr, iter_num, max_iter, gamma=10, power=0.75):
     """
@@ -143,14 +144,14 @@ for epoch in range(args.epochs):
         shifts_b_inputs = torch.roll(inputs, shifts=1, dims=0)
         shifts_b_inputs[0, ...] = 0.
         inp = torch.concat([shifts_b_inputs, inputs], dim=1)
-        inp = inp.unsqueeze(dim=2).repeat(1, 1, 3, 1, 1)
+        inp = inp.unsqueeze(dim=2)  # .repeat(1, 1, 3, 1, 1)
 
         net.train()
         optimizer.zero_grad()
         lr_scheduler(optimizer=optimizer, init_lr=args.lr, iter_num=i,
-                     max_iter=args.epochs * iters, gamma=10, power=0.75)
+                     max_iter=args.epochs * iters, gamma=5, power=0.75)
 
-        p_0 = 0.95 * (epoch / args.epochs)
+        p_0 = min(0.95 * (3 * epoch / args.epochs), 0.5)
         p_1 = 1 - p_0
         pos_id = np.random.choice([0, 1], size=(1, ), replace=False, p=[p_0, p_1])[0]
         loss = net(inp, lbl=labels.squeeze(1), pos_id=int(pos_id))
@@ -192,7 +193,7 @@ for epoch in range(args.epochs):
 
                     in_data = torch.concat([shifts_b_inputs, in_data], dim=1)
 
-                    in_data = in_data.unsqueeze(dim=2).repeat(1, 1, 3, 1, 1)
+                    in_data = in_data.unsqueeze(dim=2)  # .repeat(1, 1, 3, 1, 1)
 
                     out_data = net(in_data, pos_id=kk%2)
                     _, predicted = torch.max(out_data, 1)

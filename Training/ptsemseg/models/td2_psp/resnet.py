@@ -209,18 +209,18 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x, aux=True):
-        x = self.conv1(x)
+    def forward(self, x, aux=True): # x: (_, 3, 320, 192)
+        x = self.conv1(x)       # (_, 64, 160, 96)
         x = self.bn1(x)
         x = self.relu(x)
-        x = self.maxpool(x)
+        x = self.maxpool(x)     # (_,  64, 80, 48)
 
-        c1 = self.layer1(x)
-        c2 = self.layer2(c1)
-        c3 = self.layer3(c2)
-        c4 = self.layer4(c3)
+        c1 = self.layer1(x)     # (_,  64, 80, 48)
+        c2 = self.layer2(c1)    # (_, 128, 40, 24)
+        c3 = self.layer3(c2)    # (_, 256, 40, 24)
+        c4 = self.layer4(c3)    # (_, 512, 40, 24)
         if aux:
-            return c3,c4
+            return c1, c2, c3,c4
         else:
             return c4
 
