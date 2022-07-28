@@ -1,16 +1,16 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
+import os
+from collections import OrderedDict
+
 from .resnet import resnet18, resnet34, resnet50
-import random
+from .transformer import Encoding, Attention
 from ptsemseg.utils import split_psp_dict
 from ptsemseg.models.td2_psp.pspnet_2p import pspnet_2p
-import logging
-import pdb
-import os
 from ptsemseg.loss import OhemCELoss2D, SegmentationLosses
-from .transformer import Encoding, Attention
-from Training.utils.CCT_tool.unet import Encoder, Decoder
+from Training.utils.CCT_tool.unet import Encoder, Decoder, Encoder_2, Decoder_2
 
 up_kwargs = {'mode': 'bilinear', 'align_corners': True}
 logger = logging.getLogger("ptsemseg")
@@ -67,9 +67,10 @@ class td2_psp(nn.Module):
                   'dropout': [0., 0., 0., 0., 0.],
                   'class_num': 2,
                   'bilinear': False,
-                  'acti_func': 'relu'}
-        self.pretrained3 = Encoder(params)  # todo: 使用FusionNet_2D
-        self.pretrained4 = Encoder(params)
+                  'acti_func': 'relu',
+                  'num_heads': [2, 4, 8, 16]}
+        self.pretrained3 = Encoder_2(params)  # todo: 使用FusionNet_2D
+        self.pretrained4 = Encoder_2(params)
 
         self.decoder = Decoder(params)
 
@@ -89,7 +90,7 @@ class td2_psp(nn.Module):
             self.auxlayer2 = FCNHead(256 // 2 * self.expansion, nclass, norm_layer)
 
         # self.pretrained_init()
-        self.init()
+        self.init_encoder()   # load pretrained weights.
         self.KLD = nn.KLDivLoss()
         # self.get_params()
         self.teacher = teacher
@@ -165,7 +166,7 @@ class td2_psp(nn.Module):
         features3.pop()
         features3.append(self.layer_norm2(atn_2 + v2).repeat(1, 4, 1, 1))
         out2 = self.decoder(features3)
-        # ↑ (_, 2, 320, 192), Todo: how to up sample (_, 128, 20, 12)--> (_, 2, 320, 192)
+        # ↑ (_, 2, 320, 192), Done: up sample (_, 128, 20, 12)--> (_, 2, 320, 192)
 
         features3.pop()
         features3.append(self.layer_norm2(v2).repeat(1, 4, 1, 1))
@@ -275,18 +276,15 @@ class td2_psp(nn.Module):
             else:
                 logger.info("No pretrained found at '{}'".format(self.psp_path))
 
-    def init(self):
+    def init_encoder(self):
         try:
-            a = torch.load("/storage/wuyonghuang/airway/result/TDNet_V2_1.0/model/model_epoch_13.pth")
-            from collections import OrderedDict
-            weights3, weights4 = OrderedDict(), OrderedDict()
+            # a = torch.load("/storage/wuyonghuang/airway/result/TDNet_V2_1.0/model/model_epoch_13.pth")
+            a = torch.load("/storage/wuyonghuang/airway/result/FusionNet/model/model_epoch_38.pth")
+            weights = OrderedDict()
             for key in a.keys():
-                if 'pretrained3' in key:
-                    weights3['.'.join(key.split('.')[2:])] = a[key]
-                if 'pretrained4' in key:
-                    weights4['.'.join(key.split('.')[2:])] = a[key]
-            self.pretrained3.load_state_dict(weights3)
-            self.pretrained4.load_state_dict(weights4)
+                if 'encoder' in key:
+                    weights['.'.join(key.split('.')[2:])] = a[key]
+            self.pretrained3.load_state_dict(weights)
             print('load weights successfully.')
         except:
             print('Not load weights successfully.')

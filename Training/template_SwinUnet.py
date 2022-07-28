@@ -63,7 +63,7 @@ args = parser()
 args.seed = 0
 args.epochs = 50
 args.earlystop = 5
-args.lr = 3e-4  # Note.
+args.lr = 5e-4  # Note.
 args.ratio = 1.0
 args.batchsize = torch.cuda.device_count()
 torch.manual_seed(args.seed)
@@ -138,12 +138,18 @@ for epoch in range(args.epochs):
         if flag:
             print('early stop.')
             break
+    p_0 = min(0.95 * (3 * epoch / args.epochs), 0.5)
+    p_1 = 1 - p_0
     for i in tqdm(range(iters), desc='training'):
         inputs, labels, _ = next(iterator)
-
-        shifts_b_inputs = torch.roll(inputs, shifts=1, dims=0)
-        shifts_b_inputs[0, ...] = 0.
-        inp = torch.concat([shifts_b_inputs, inputs], dim=1)
+        lst = []
+        for ii in range(args.batchsize):
+            inp = inputs[ii*c16_32:(ii+1)*32]
+            shifts_b_inputs = torch.roll(inp, shifts=1, dims=0)
+            shifts_b_inputs[0, ...] = inp[0]
+            inp_ = torch.concat([shifts_b_inputs, inp], dim=1)
+            lst.append(inp_)
+        inp = torch.concat(lst, dim=0)
         inp = inp.unsqueeze(dim=2)  # .repeat(1, 1, 3, 1, 1)
 
         net.train()
@@ -151,8 +157,6 @@ for epoch in range(args.epochs):
         lr_scheduler(optimizer=optimizer, init_lr=args.lr, iter_num=i,
                      max_iter=args.epochs * iters, gamma=5, power=0.75)
 
-        p_0 = min(0.95 * (3 * epoch / args.epochs), 0.5)
-        p_1 = 1 - p_0
         pos_id = np.random.choice([0, 1], size=(1, ), replace=False, p=[p_0, p_1])[0]
         loss = net(inp, lbl=labels.squeeze(1), pos_id=int(pos_id))
 
@@ -189,13 +193,14 @@ for epoch in range(args.epochs):
                     in_data = in_data.cuda()
 
                     shifts_b_inputs = torch.roll(in_data, shifts=1, dims=0)
-                    shifts_b_inputs[0, ...] = 0.
+                    shifts_b_inputs[0, ...] = in_data[0, ...]
 
                     in_data = torch.concat([shifts_b_inputs, in_data], dim=1)
 
                     in_data = in_data.unsqueeze(dim=2)  # .repeat(1, 1, 3, 1, 1)
 
-                    out_data = net(in_data, pos_id=kk%2)
+                    pos_id = np.random.choice([0, 1], size=(1,), replace=False, p=[p_0, p_1])[0]
+                    out_data = net(in_data, pos_id=pos_id)
                     _, predicted = torch.max(out_data, 1)
                     if kk != (test_iteration - 1):
                         res[kk * d__:(kk + 1) * d__, :, 4:196] = np.squeeze(predicted.cpu().detach().numpy())
